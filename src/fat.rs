@@ -273,7 +273,7 @@ impl FatVolume {
             ));
         }
         let mut lfn: Vec<[u8; 32]> = vec![];
-        for (slot, row) in data.chunks_exact(32).enumerate() {
+        for (slot, row) in data.as_chunks::<32>().0.iter().enumerate() {
             if slot >= 32768
                 || out.found.len() >= 2048
                 || out.directories.len() >= 4096
@@ -292,7 +292,7 @@ impl FatVolume {
             }
             if row[11] == 0x0f {
                 if lfn.len() < 20 {
-                    lfn.push(row.try_into().expect("directory slot"));
+                    lfn.push(*row);
                 } else {
                     lfn.clear();
                 }

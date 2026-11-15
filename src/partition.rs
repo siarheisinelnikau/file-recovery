@@ -120,7 +120,9 @@ fn gpt(source: &mut dyn ReadSource) -> Result<Vec<Region>> {
             .ok_or("GPT length overflow")?;
         source::checked_range(offset, length, source.len())?;
         let words: Vec<u16> = row[56..128]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|x| u16::from_le_bytes([x[0], x[1]]))
             .take_while(|v| *v != 0)
             .collect();
