@@ -1,0 +1,4 @@
+/target/
+/dist/
+*.scan.json
+*.part
