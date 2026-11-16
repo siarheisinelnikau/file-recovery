@@ -1,5 +1,5 @@
 THIRD-PARTY LICENSE NOTICES
-File Recovery 0.1.0
+File Recovery 0.2.0
 
 Dependency copyrights and licenses remain with their respective owners.
 This inventory includes build and test dependencies from Cargo.lock.

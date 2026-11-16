@@ -3,11 +3,13 @@ import io
 import json
 import struct
 import sys
+import tomllib
 from pathlib import Path
 from PIL import Image
 
 root = Path(__file__).resolve().parent.parent
-path = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "dist" / "FileRecovery-v0.1.0.exe"
+version=tomllib.loads((root/"Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+path = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "dist" / f"FileRecovery-v{version}.exe"
 data = path.read_bytes()
 
 def u16(at):

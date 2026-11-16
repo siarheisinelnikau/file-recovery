@@ -1,20 +1,10 @@
-use crate::{
-    Result,
-    engine::Candidate,
-    source::{self, ReadSource},
-};
+use crate::{Result, engine::Candidate, source::ReadSource};
 
 /// No shell, executable content, HTML renderer or document decoder is involved.
 pub fn preview(source: &mut dyn ReadSource, item: &Candidate) -> Result<String> {
     item.validate(source.len())?;
-    let mut data = Vec::new();
-    for e in &item.extents {
-        let n = e.length.min(16_384 - data.len() as u64) as usize;
-        if n == 0 {
-            break;
-        }
-        data.extend(source::bytes(source, e.offset, n)?);
-    }
+    let mut data = vec![0; item.recovered_size.min(16384) as usize];
+    item.read_at(source, 0, &mut data)?;
     if let Ok(text) = std::str::from_utf8(&data)
         && !data.contains(&0)
         && text

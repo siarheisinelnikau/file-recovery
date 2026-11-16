@@ -479,6 +479,17 @@ unsafe extern "system" fn body_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
 }
 
 impl Ui {
+    fn can_restore(&self) -> bool {
+        self.state.as_ref().is_some_and(|state| {
+            self.selected
+                .iter()
+                .filter_map(|index| state.results.get(*index))
+                .any(|item| {
+                    item.confidence != Confidence::Unsupported
+                        && (item.recovered_size > 0 || item.expected_size == 0)
+                })
+        })
+    }
     fn tr(&self, key: &str) -> String {
         self.strings.text(key).into()
     }
@@ -726,6 +737,7 @@ impl Ui {
             &[
                 self.tr("all"),
                 self.tr("fat"),
+                self.tr("ntfs"),
                 self.tr("png"),
                 self.tr("partial"),
             ],
@@ -824,7 +836,7 @@ impl Ui {
                     self.place(SAFETY, 48, 420, w - 96, 28);
                     self.place(SAFETY_HELP, 48, 460, w - 96, 68);
                     self.place(SUPPORTED, 32, 558, w - 64, 28);
-                    self.place(SUPPORTED_HELP, 32, 598, w - 64, 90);
+                    self.place(SUPPORTED_HELP, 32, 598, w - 64, 110);
                 }
                 self.place(RESUME, 32, h - 122, 380, 46);
                 self.place(SCAN, w - 302, h - 122, 270, 46);
@@ -1067,15 +1079,15 @@ impl Ui {
         );
         EnableWindow(
             self.control(NAV_RESTORE),
-            i32::from(!self.selected.is_empty() && !self.busy),
+            i32::from(self.can_restore() && !self.busy),
         );
         EnableWindow(
             self.control(NEXT),
-            i32::from(!self.selected.is_empty() && !self.busy),
+            i32::from(self.can_restore() && !self.busy),
         );
         EnableWindow(
             self.control(RESTORE),
-            i32::from(!self.selected.is_empty() && !self.busy),
+            i32::from(self.can_restore() && !self.busy),
         );
         EnableWindow(
             self.control(CHECK),
@@ -1092,25 +1104,29 @@ impl Ui {
         match &self.progress {
             Some(WorkProgress::Scan(p)) => format!(
                 "{}  ·  {}: {}  ·  {}: {} / {}",
-                self.tr(if p.phase == Phase::Metadata {
-                    "scan_metadata"
-                } else {
-                    "scan_signatures"
+                self.tr(match p.phase {
+                    Phase::Metadata => "scan_metadata",
+                    Phase::NtfsMetadata => "scan_ntfs",
+                    _ => "scan_signatures",
                 }),
                 self.tr("files"),
                 p.found,
-                self.tr(if p.phase == Phase::Metadata {
-                    "directories"
-                } else {
-                    "scanned"
+                self.tr(match p.phase {
+                    Phase::Metadata => "directories",
+                    Phase::NtfsMetadata => "records",
+                    _ => "scanned",
                 }),
                 if p.phase == Phase::Metadata {
                     p.directories
+                } else if p.phase == Phase::NtfsMetadata {
+                    p.records
                 } else {
                     p.bytes_scanned
                 },
                 if p.phase == Phase::Metadata {
                     String::from("—")
+                } else if p.phase == Phase::NtfsMetadata {
+                    p.total_records.to_string()
                 } else {
                     p.total_bytes.to_string()
                 }
@@ -1142,7 +1158,7 @@ impl Ui {
                 text.push_str("\r\n");
                 text.push_str(warning);
             }
-            text.push_str(&format!("\r\nFAT volumes: {}; checkpoint schema: 1; source: {} B\r\nIdentity uses length, modification time and 3 sparse SHA-256 samples, not a full-source hash.",state.volumes.len(),state.identity.length));
+            text.push_str(&format!("\r\nFAT volumes: {}; NTFS volumes: {}; checkpoint schema: 2; source: {} B\r\nIdentity uses length, modification time and 3 sparse SHA-256 samples, not a full-source hash.",state.volumes.len(),state.ntfs.len(),state.identity.length));
         }
         text.push_str(&format!("\r\nRenderer: native Win32 controls + CPU GDI.\r\nMain-window layouts: {}; paint callbacks: {}.\r\nIdle/hidden and accessibility validation pending.",self.layouts,self.paints));
         text
@@ -1156,11 +1172,14 @@ impl Ui {
                 Confidence::Partial => "quality_partial",
                 Confidence::Unverified => "quality_uncertain",
                 Confidence::StructureVerified => "quality_png",
+                Confidence::Unsupported => "quality_unsupported",
             };
             let kind = match item.kind {
                 RecoveryKind::FatChain => "kind_chain",
                 RecoveryKind::FatContiguous => "kind_contiguous",
                 RecoveryKind::PngCarved => "kind_png",
+                RecoveryKind::NtfsResident => "kind_ntfs_resident",
+                RecoveryKind::NtfsRuns => "kind_ntfs_runs",
             };
             self.set(
                 PREVIEW_META,
@@ -1174,13 +1193,17 @@ impl Ui {
                     item.expected_size
                 ),
             );
-            let note = if item.confidence == Confidence::Partial {
+            let note = if item.confidence == Confidence::Unsupported {
+                "note_ntfs_unsupported"
+            } else if item.confidence == Confidence::Partial {
                 "note_partial"
             } else {
                 match item.kind {
                     RecoveryKind::FatChain => "note_chain",
                     RecoveryKind::FatContiguous => "note_contiguous",
                     RecoveryKind::PngCarved => "note_png",
+                    RecoveryKind::NtfsResident => "note_ntfs_resident",
+                    RecoveryKind::NtfsRuns => "note_ntfs_runs",
                 }
             };
             self.set(PREVIEW_NOTE, &self.tr(note));
@@ -1251,9 +1274,18 @@ impl Ui {
         if let Some(state) = &self.state {
             for (index, item) in state.results.iter().enumerate() {
                 if !item.original_path.to_lowercase().contains(&search)
-                    || (filter == 1 && item.kind == RecoveryKind::PngCarved)
-                    || (filter == 2 && item.kind != RecoveryKind::PngCarved)
-                    || (filter == 3 && item.confidence != Confidence::Partial)
+                    || (filter == 1
+                        && !matches!(
+                            item.kind,
+                            RecoveryKind::FatChain | RecoveryKind::FatContiguous
+                        ))
+                    || (filter == 2
+                        && !matches!(
+                            item.kind,
+                            RecoveryKind::NtfsResident | RecoveryKind::NtfsRuns
+                        ))
+                    || (filter == 3 && item.kind != RecoveryKind::PngCarved)
+                    || (filter == 4 && item.confidence != Confidence::Partial)
                 {
                     continue;
                 }
@@ -1261,6 +1293,7 @@ impl Ui {
                     Confidence::Partial => "quality_partial",
                     Confidence::Unverified => "quality_uncertain",
                     Confidence::StructureVerified => "quality_png",
+                    Confidence::Unsupported => "quality_unsupported",
                 };
                 let row = format!(
                     "{}   |   {} B   |   {}",
@@ -1481,7 +1514,7 @@ impl Ui {
         let Some(state) = &self.state else {
             return;
         };
-        if self.selected.is_empty() {
+        if !self.can_restore() {
             self.status_key = "choose_files";
             self.refresh();
             return;
@@ -1787,7 +1820,7 @@ impl Ui {
         match id {
             NAV_SOURCE if !self.busy => self.page(Page::Source),
             NAV_RESULTS if self.state.is_some() || self.busy => self.page(Page::Results),
-            NAV_RESTORE | NEXT if !self.busy && !self.selected.is_empty() => {
+            NAV_RESTORE | NEXT if !self.busy && self.can_restore() => {
                 self.summary = None;
                 self.page(Page::Restore);
             }

@@ -1,6 +1,7 @@
 pub mod engine;
 pub mod fat;
 pub mod i18n;
+pub mod ntfs;
 pub mod partition;
 pub mod preview;
 pub mod restore;

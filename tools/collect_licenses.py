@@ -5,7 +5,8 @@ from pathlib import Path
 root = Path(__file__).resolve().parent.parent
 metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--offline", "--format-version", "1", "--filter-platform", "x86_64-pc-windows-msvc"], cwd=root))
 active = {node["id"] for node in metadata["resolve"]["nodes"]}
-sections = ["THIRD-PARTY LICENSE NOTICES\nFile Recovery 0.1.0\n\nDependency copyrights and licenses remain with their respective owners.\nThis inventory includes build and test dependencies from Cargo.lock.\n"]
+version=next(p["version"] for p in metadata["packages"] if p["name"]=="file-recovery")
+sections = [f"THIRD-PARTY LICENSE NOTICES\nFile Recovery {version}\n\nDependency copyrights and licenses remain with their respective owners.\nThis inventory includes build and test dependencies from Cargo.lock.\n"]
 missing = []
 for package in sorted(metadata["packages"], key=lambda p: p["name"]):
     if package["id"] not in active or package["name"] == "file-recovery":

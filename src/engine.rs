@@ -1,6 +1,7 @@
 use crate::{
     Result,
     fat::{DirectoryTask, FatVolume},
+    ntfs::{MAX_RECORDS, NtfsVolume},
     partition,
     source::{self, ReadSource, SourceIdentity},
 };
@@ -16,23 +17,29 @@ pub const MAX_RESULTS: usize = 10_000;
 const MAX_DIRECTORIES: usize = 4096;
 const CHUNK: u64 = 1024 * 1024;
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+const MAX_INLINE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Extent {
     pub offset: u64,
     pub length: u64,
+    #[serde(default)]
+    pub zero_fill: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecoveryKind {
     FatChain,
     FatContiguous,
     PngCarved,
+    NtfsResident,
+    NtfsRuns,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Confidence {
     Unverified,
     Partial,
     StructureVerified,
+    Unsupported,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Candidate {
@@ -44,6 +51,8 @@ pub struct Candidate {
     pub kind: RecoveryKind,
     pub confidence: Confidence,
     pub note: String,
+    #[serde(default)]
+    pub inline_data: Option<Vec<u8>>,
 }
 
 impl Candidate {
@@ -52,9 +61,26 @@ impl Candidate {
         {
             return Err("Result exceeds safety limits".into());
         }
-        let mut length = 0u64;
+        let mut length = self
+            .inline_data
+            .as_ref()
+            .map_or(0, |data| data.len() as u64);
+        if self
+            .inline_data
+            .as_ref()
+            .is_some_and(|data| data.len() > 65536)
+            || (self.inline_data.is_some() && !self.extents.is_empty())
+            || (self.inline_data.is_some() && self.kind != RecoveryKind::NtfsResident)
+        {
+            return Err("Invalid resident recovery data".into());
+        }
         for e in &self.extents {
-            source::checked_range(e.offset, e.length, source_len)?;
+            if !e.zero_fill {
+                source::checked_range(e.offset, e.length, source_len)?;
+            }
+            if e.zero_fill && !matches!(self.kind, RecoveryKind::NtfsRuns) {
+                return Err("Zero-filled ranges are valid only for NTFS streams".into());
+            }
             length = length
                 .checked_add(e.length)
                 .ok_or("Result length overflow")?;
@@ -67,6 +93,49 @@ impl Candidate {
         }
         Ok(())
     }
+
+    pub fn read_at(&self, source: &mut dyn ReadSource, offset: u64, out: &mut [u8]) -> Result<()> {
+        source::checked_range(offset, out.len() as u64, self.recovered_size)?;
+        if let Some(data) = &self.inline_data {
+            let start = usize::try_from(offset).map_err(crate::io_error)?;
+            out.copy_from_slice(
+                data.get(
+                    start
+                        ..start
+                            .checked_add(out.len())
+                            .ok_or("Resident offset overflow")?,
+                )
+                .ok_or("Resident content is truncated")?,
+            );
+            return Ok(());
+        }
+        let mut logical = 0u64;
+        let mut written = 0;
+        for extent in &self.extents {
+            let end = logical
+                .checked_add(extent.length)
+                .ok_or("Stream overflow")?;
+            if offset + (written as u64) < end {
+                let skip = (offset + written as u64).saturating_sub(logical);
+                let count = (extent.length - skip).min((out.len() - written) as u64) as usize;
+                if extent.zero_fill {
+                    out[written..written + count].fill(0);
+                } else {
+                    source.read_at(extent.offset + skip, &mut out[written..written + count])?;
+                }
+                written += count;
+                if written == out.len() {
+                    return Ok(());
+                }
+            }
+            logical = end;
+        }
+        if out.is_empty() {
+            Ok(())
+        } else {
+            Err("Incomplete recovery layout".into())
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,8 +145,15 @@ pub struct ScanOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Metadata,
+    NtfsMetadata,
     Signatures,
     Finished,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NtfsCursor {
+    pub volume: NtfsVolume,
+    pub next_record: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,6 +162,8 @@ pub struct ScanState {
     pub identity: SourceIdentity,
     pub options: ScanOptions,
     pub volumes: Vec<FatVolume>,
+    #[serde(default)]
+    pub ntfs: Vec<NtfsCursor>,
     pub phase: Phase,
     queue: VecDeque<DirectoryTask>,
     visited: Vec<(usize, u32)>,
@@ -93,6 +171,8 @@ pub struct ScanState {
     pub results: Vec<Candidate>,
     pub warnings: Vec<String>,
     pub directories_read: u64,
+    #[serde(default)]
+    pub records_read: u64,
     pub capped: bool,
 }
 
@@ -103,6 +183,8 @@ pub struct Progress {
     pub bytes_scanned: u64,
     pub total_bytes: u64,
     pub found: usize,
+    pub records: u64,
+    pub total_records: u64,
 }
 
 impl ScanState {
@@ -114,9 +196,25 @@ impl ScanState {
         }
         let mut warnings = vec![];
         let mut volumes = vec![];
+        let mut ntfs = vec![];
         match regions {
             Ok(regions) => {
-                for region in regions {
+                if regions.len() > 64 {
+                    warnings.push("Volume count exceeds 64; metadata scanning is partial.".into());
+                }
+                for region in regions.into_iter().take(64) {
+                    if source::bytes(source, region.offset, 512)
+                        .is_ok_and(|b| &b[3..11] == b"NTFS    ")
+                    {
+                        match NtfsVolume::parse(source, region.clone()) {
+                            Ok(volume) => ntfs.push(NtfsCursor {
+                                volume,
+                                next_record: 0,
+                            }),
+                            Err(e) => warnings.push(format!("{}: {e}", region.label)),
+                        }
+                        continue;
+                    }
                     match FatVolume::parse(source, region.clone()) {
                         Ok(v) => volumes.push(v),
                         Err(e) => warnings.push(format!("{}: {e}", region.label)),
@@ -125,15 +223,16 @@ impl ScanState {
             }
             Err(e) => warnings.push(e),
         }
-        if volumes.is_empty() {
-            warnings.push("No supported FAT16/FAT32 volume. Only validated PNG carving is available; original paths cannot be recovered.".into());
+        if volumes.is_empty() && ntfs.is_empty() {
+            warnings.push("No supported FAT16/FAT32/NTFS volume. Only validated PNG carving is available; original paths cannot be recovered.".into());
         }
         let queue = volumes.iter().enumerate().map(|(i, v)| v.root(i)).collect();
         Ok(Self {
-            version: 1,
+            version: 2,
             identity,
             options,
             volumes,
+            ntfs,
             phase: Phase::Metadata,
             queue,
             visited: vec![],
@@ -141,6 +240,7 @@ impl ScanState {
             results: vec![],
             warnings,
             directories_read: 0,
+            records_read: 0,
             capped: false,
         })
     }
@@ -153,7 +253,13 @@ impl ScanState {
         let state: Self = serde_json::from_slice(&fs::read(path).map_err(crate::io_error)?)
             .map_err(crate::io_error)?;
         let fresh = Self::start(source, state.options.clone())?;
-        if state.version != 1 || state.identity != fresh.identity || state.volumes != fresh.volumes
+        if !matches!(state.version, 1 | 2)
+            || state.identity != fresh.identity
+            || state.volumes != fresh.volumes
+            || state.ntfs.len() != fresh.ntfs.len()
+            || state.ntfs.iter().zip(&fresh.ntfs).any(|(a, b)| {
+                a.volume != b.volume || a.next_record > a.volume.record_count.min(MAX_RECORDS)
+            })
         {
             return Err("Checkpoint does not match this source; start a new scan".into());
         }
@@ -163,6 +269,7 @@ impl ScanState {
             || state.warnings.len() > 100
             || state.carve_offset > source.len()
             || state.directories_read > MAX_DIRECTORIES as u64
+            || state.records_read > MAX_RECORDS * state.ntfs.len() as u64
         {
             return Err("Checkpoint exceeds scan limits".into());
         }
@@ -176,6 +283,16 @@ impl ScanState {
         }
         if state.results.iter().map(|c| c.extents.len()).sum::<usize>() > 262144 {
             return Err("Checkpoint exceeds the extent budget".into());
+        }
+        if state
+            .results
+            .iter()
+            .filter_map(|c| c.inline_data.as_ref())
+            .map(Vec::len)
+            .sum::<usize>()
+            > MAX_INLINE_BYTES
+        {
+            return Err("Checkpoint exceeds the resident data budget".into());
         }
         Ok(state)
     }
@@ -197,6 +314,12 @@ impl ScanState {
             bytes_scanned: self.carve_offset,
             total_bytes: self.identity.length,
             found: self.results.len(),
+            records: self.records_read,
+            total_records: self
+                .ntfs
+                .iter()
+                .map(|v| v.volume.record_count.min(MAX_RECORDS))
+                .sum(),
         }
     }
 
@@ -279,7 +402,73 @@ impl ScanState {
                         }
                     }
                 } else {
+                    self.phase = Phase::NtfsMetadata;
+                }
+            }
+            Phase::NtfsMetadata => {
+                let index = self
+                    .ntfs
+                    .iter()
+                    .position(|c| c.next_record < c.volume.record_count.min(MAX_RECORDS));
+                let Some(index) = index else {
+                    if self
+                        .ntfs
+                        .iter()
+                        .any(|c| c.volume.record_count > MAX_RECORDS)
+                    {
+                        self.capped = true;
+                        self.warning(
+                            "NTFS MFT record limit reached; metadata scan is partial.".into(),
+                        );
+                    }
                     self.phase = Phase::Signatures;
+                    return Ok(true);
+                };
+                let record = self.ntfs[index].next_record;
+                let result = self.ntfs[index].volume.read_deleted(source, record, cancel);
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(false);
+                }
+                self.ntfs[index].next_record += 1;
+                self.records_read += 1;
+                match result {
+                    Ok(read) => {
+                        if let Some(w) = read.warning {
+                            self.warning(format!("MFT record {record}: {w}"));
+                        }
+                        if let Some(mut c) = read.candidate {
+                            let inline: usize = self
+                                .results
+                                .iter()
+                                .filter_map(|c| c.inline_data.as_ref())
+                                .map(Vec::len)
+                                .sum();
+                            let extents: usize = self.results.iter().map(|c| c.extents.len()).sum();
+                            if inline + c.inline_data.as_ref().map_or(0, Vec::len)
+                                > MAX_INLINE_BYTES
+                                || extents + c.extents.len() > 262144
+                            {
+                                self.capped = true;
+                                self.warning(
+                                    "Recovery metadata budget reached; NTFS results are partial."
+                                        .into(),
+                                );
+                                self.ntfs[index].next_record =
+                                    self.ntfs[index].volume.record_count.min(MAX_RECORDS);
+                            } else {
+                                if c.confidence == Confidence::Unsupported {
+                                    self.warning(format!("MFT record {record}: {}", c.note));
+                                }
+                                c.id = self.results.len() as u64;
+                                c.validate(source.len())?;
+                                self.results.push(c);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.capped = true;
+                        self.warning(format!("MFT record {record}: {e}"));
+                    }
                 }
             }
             Phase::Signatures => {
@@ -312,14 +501,16 @@ impl ScanState {
                     }
                     if let Some(length) = length {
                         let overlaps = self.results.iter().any(|c| {
-                            c.extents
-                                .iter()
-                                .any(|e| e.offset < offset + length && offset < e.offset + e.length)
+                            c.extents.iter().any(|e| {
+                                !e.zero_fill
+                                    && e.offset < offset + length
+                                    && offset < e.offset + e.length
+                            })
                         });
                         if !overlaps {
                             let id = self.results.len() as u64;
                             self.results.push(Candidate { id, original_path: format!("PNG-{offset:016X}.png"), expected_size: length, recovered_size: length,
-                                extents: vec![Extent { offset, length }], kind: RecoveryKind::PngCarved, confidence: Confidence::StructureVerified,
+                                extents: vec![Extent { offset, length, zero_fill:false }], inline_data:None,kind: RecoveryKind::PngCarved, confidence: Confidence::StructureVerified,
                                 note: "PNG chunk order, lengths and CRCs validated. Pixel decompression is not verified. Original name/path unknown; the file may also be live.".into() });
                             if self.results.len() == MAX_RESULTS {
                                 self.capped = true;

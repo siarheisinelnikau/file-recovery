@@ -41,7 +41,7 @@ fn agent(timeout: Duration) -> ureq::Agent {
         .timeout_global(Some(timeout))
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_per_read(Some(Duration::from_secs(20)))
-        .user_agent("FileRecovery/0.1.0")
+        .user_agent(concat!("FileRecovery/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
 }

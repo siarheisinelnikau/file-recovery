@@ -21,6 +21,13 @@ pub fn discover(source: &mut dyn ReadSource, explicit_offset: Option<u64>) -> Re
         }]);
     }
     let boot = source::bytes(source, 0, 512)?;
+    if &boot[3..11] == b"NTFS    " {
+        return Ok(vec![Region {
+            offset: 0,
+            length: source.len(),
+            label: "NTFS image".into(),
+        }]);
+    }
     // A plausible BPB identifies a superfloppy before interpreting its code as MBR entries.
     if boot[510..512] == [0x55, 0xaa]
         && matches!(le16(&boot, 11), 512 | 1024 | 2048 | 4096)

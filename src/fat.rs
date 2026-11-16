@@ -194,6 +194,7 @@ impl FatVolume {
                 extents.push(Extent {
                     offset,
                     length: count,
+                    zero_fill: false,
                 });
             }
             remaining -= count;
@@ -222,6 +223,7 @@ impl FatVolume {
                 vec![Extent {
                     offset: self.root_offset,
                     length: self.root_bytes,
+                    zero_fill: false,
                 }],
                 true,
             )
@@ -241,6 +243,7 @@ impl FatVolume {
                 extents.push(Extent {
                     offset: self.offset(c)?,
                     length: self.cluster_size,
+                    zero_fill: false,
                 });
                 let next = self.next(source, c)?;
                 if self.end(next) {
@@ -342,7 +345,7 @@ impl FatVolume {
             let (extents, full, contiguous) = self.layout(source, cluster, size, true, cancel)?;
             extent_count += extents.len();
             let recovered: u64 = extents.iter().map(|e| e.length).sum();
-            out.found.push(Candidate { id: 0, original_path: path, expected_size: size, recovered_size: recovered, extents,
+            out.found.push(Candidate { id: 0, original_path: path, expected_size: size, recovered_size: recovered, extents,inline_data:None,
                 kind: if contiguous { RecoveryKind::FatContiguous } else { RecoveryKind::FatChain },
                 confidence: if full { Confidence::Unverified } else { Confidence::Partial },
                 note: if !full { "Only a bounded prefix is readable; the chain is invalid, cyclic, allocated or truncated." }

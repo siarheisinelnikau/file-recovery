@@ -95,6 +95,9 @@ fn restore_one(
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64),
 ) -> Result<PathBuf> {
+    if item.confidence == Confidence::Unsupported {
+        return Err("This NTFS layout is unsupported; no output was written".into());
+    }
     if item.recovered_size == 0 && item.expected_size != 0 {
         return Err("No readable data for this entry".into());
     }
@@ -111,6 +114,14 @@ fn restore_one(
     let pending = Pending(temp.clone());
     let mut buffer = vec![0; 1024 * 1024];
     let mut copied = 0;
+    if let Some(data) = &item.inline_data {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Restore cancelled".into());
+        }
+        file.write_all(data).map_err(crate::io_error)?;
+        copied = data.len() as u64;
+        progress(copied);
+    }
     for extent in &item.extents {
         let mut done = 0;
         while done < extent.length {
@@ -118,7 +129,11 @@ fn restore_one(
                 return Err("Restore cancelled".into());
             }
             let n = (extent.length - done).min(buffer.len() as u64) as usize;
-            source.read_at(extent.offset + done, &mut buffer[..n])?;
+            if extent.zero_fill {
+                buffer[..n].fill(0);
+            } else {
+                source.read_at(extent.offset + done, &mut buffer[..n])?;
+            }
             file.write_all(&buffer[..n]).map_err(crate::io_error)?;
             done += n as u64;
             copied += n as u64;

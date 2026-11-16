@@ -325,6 +325,7 @@ fn truncations_mutations_and_malformed_result_do_not_panic() {
     item.extents = vec![Extent {
         offset: u64::MAX,
         length: 2,
+        zero_fill: false,
     }];
     assert!(preview::preview(&mut s, &item).is_err());
 }
@@ -464,7 +465,9 @@ fn cancelled_png_validation_resumes_the_same_block() {
         at: 608,
     };
     let mut state = ScanState::start(&mut s, ScanOptions::default()).unwrap();
-    state.step(&mut s, &cancel).unwrap();
+    while state.phase != Phase::Signatures {
+        state.step(&mut s, &cancel).unwrap();
+    }
     assert_eq!(state.phase, Phase::Signatures);
     s.armed = true;
     assert!(!state.step(&mut s, &cancel).unwrap());
